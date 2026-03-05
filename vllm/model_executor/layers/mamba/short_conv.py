@@ -141,16 +141,12 @@ class ShortConv(MambaBase, CustomOp):
             [num_decodes, num_prefill_tokens],
             dim=0,
         )
-        state_indices_d, state_indices_p = torch.split(
-            attn_metadata.state_indices_tensor,
-            [num_decodes, num_prefills],
-            dim=0,
-        )
 
         conv_output_list = []
 
         # Handle Prefill (Variable sequence lengths)
         if has_prefill:
+            state_indices_p = attn_metadata.state_indices_tensor_p.flatten()
             query_start_loc_p = attn_metadata.query_start_loc_p
             for i in range(num_prefills):
                 # Use query_start_loc_p to get exact start/end bounds for each sequence
@@ -185,6 +181,7 @@ class ShortConv(MambaBase, CustomOp):
 
         # Handle Decode (Single tokens using history)
         if has_decode:
+            state_indices_d = attn_metadata.state_indices_tensor_d.flatten()
             Bx_d = B_d * x_d  # Shape: (num_decodes, dim)
 
             # Fetch past state for each decoding sequence
@@ -265,8 +262,9 @@ class ShortConv(MambaBase, CustomOp):
             # V1 profile run
             Bx = (B * x).contiguous()
             hidden_states = C * Bx
-            contextualized_states, _ = self.out_proj(hidden_states)
-            return contextualized_states
+            output_tensor, _ = self.out_proj(hidden_states)
+            output[: hidden_states.shape[0]] = output_tensor
+            return
 
         num_prefills = attn_metadata.num_prefills  # request count
         num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
