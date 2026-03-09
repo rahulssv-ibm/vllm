@@ -69,7 +69,7 @@ class ToolParser:
                 # structured output json settings to make tool calling work correctly
                 request.structured_outputs = StructuredOutputsParams(
                     json=json_schema_from_tool
-                )
+                )  # type: ignore[call-arg]
                 request.response_format = None
             if isinstance(request, ResponsesRequest):
                 request.text = ResponseTextConfig()
