@@ -945,15 +945,17 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            
-            # If page_size_padded is set, adjust it by the same ratio
-            new_page_size_padded = None
-            if hasattr(layer_spec, 'page_size_padded') and layer_spec.page_size_padded is not None:
-                new_page_size_padded = layer_spec.page_size_padded * ratio
-                new_spec = replace(layer_spec, block_size=new_block_size, page_size_padded=new_page_size_padded)
-            else:
+
+            page_size_padded = getattr(layer_spec, "page_size_padded", None)
+            if page_size_padded is None:
                 new_spec = replace(layer_spec, block_size=new_block_size)
-            
+            else:
+                new_spec = replace(
+                    layer_spec,
+                    block_size=new_block_size,
+                    page_size_padded=page_size_padded * ratio,
+                )
+
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
