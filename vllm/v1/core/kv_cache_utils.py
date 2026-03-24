@@ -932,22 +932,68 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+
+    def _try_with_page_size_padded(
+        layer_spec: KVCacheSpec, page_size_padded: int
+    ) -> KVCacheSpec | None:
+        # Some specs (e.g., AttentionSpec, MambaSpec) support page-size padding.
+        if not hasattr(layer_spec, "page_size_padded"):
+            return None
+        try:
+            return replace(layer_spec, page_size_padded=page_size_padded)
+        except TypeError:
+            return None
+
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        layer_page_size = layer_spec.page_size_bytes
+        if layer_page_size == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
-        else:
-            layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size != 0:
-                raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
-                )
-            ratio = max_page_size // layer_page_size
-            new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
-            new_kv_cache_spec[layer_name] = new_spec
+            continue
+
+        if max_page_size % layer_page_size != 0:
+            raise NotImplementedError(
+                "The page size of the layer is not divisible by the "
+                "maximum page size. Cannot unify by adjusting block_size."
+            )
+
+        ratio = max_page_size // layer_page_size
+        new_block_size = layer_spec.block_size * ratio
+        resized_spec = layer_spec.copy_with_new_block_size(new_block_size)
+
+        # Standard path: some specs have page size proportional to block size.
+        resized_page_size: int | None
+        try:
+            resized_page_size = resized_spec.page_size_bytes
+        except AssertionError:
+            # Can happen if an existing page_size_padded becomes invalid
+            # after changing block_size.
+            resized_page_size = None
+
+        if resized_page_size == max_page_size:
+            new_kv_cache_spec[layer_name] = resized_spec
+            continue
+
+        # Fallback path: page size may be invariant to block size (e.g., Mamba)
+        # or controlled by stale page_size_padded values. In these cases, align
+        # by setting page_size_padded directly when supported.
+        # Keep the original block_size if resizing did not affect page size.
+        pad_base_spec = (
+            layer_spec if resized_page_size == layer_page_size else resized_spec
+        )
+        padded_spec = _try_with_page_size_padded(pad_base_spec, max_page_size)
+        if padded_spec is not None:
+            try:
+                if padded_spec.page_size_bytes == max_page_size:
+                    new_kv_cache_spec[layer_name] = padded_spec
+                    continue
+            except AssertionError:
+                pass
+
+        raise NotImplementedError(
+            "Failed to unify KV-cache page sizes for layer "
+            f"{layer_name!r} from {layer_page_size} to {max_page_size} bytes."
+        )
     return new_kv_cache_spec
 
 
