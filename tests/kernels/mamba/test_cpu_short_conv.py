@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +11,11 @@ from vllm.config import CompilationConfig, ModelConfig, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
+
+if not current_platform.is_cpu():
+    pytest.skip("skipping CPU-only tests", allow_module_level=True)
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +83,7 @@ def test_short_conv_forward_native_prefill(vllm_config):
 
     with set_current_vllm_config(vllm_config):
         layer = ShortConv(config=config, dim=dim, layer_idx=0, prefix=prefix)
+
     layer.to("cpu")
     dispatch_cpu_unquantized_gemm(layer.in_proj, remove_weight=False)
     dispatch_cpu_unquantized_gemm(layer.out_proj, remove_weight=False)
@@ -98,7 +104,7 @@ def test_short_conv_forward_native_prefill(vllm_config):
         query_start_loc_p=query_start_loc_p,
         has_initial_states_p=torch.tensor([False]),
         state_indices_tensor_p=state_indices_tensor_p,
-        state_indices_tensor_d=None,
+        state_indices_tensor_d=torch.empty((0, 1), dtype=torch.int32),
         num_accepted_tokens=None,
         query_start_loc_d=None,
         block_idx_last_scheduled_token=None,
@@ -110,7 +116,6 @@ def test_short_conv_forward_native_prefill(vllm_config):
 
     # Mock KV cache
     # conv_state shape (num_blocks, L_cache - 1, dim)
-    # We need at least 1 block
     conv_state = torch.zeros((1, config.conv_L_cache - 1, dim))
     layer.kv_cache = ((conv_state,),)
 
@@ -119,7 +124,6 @@ def test_short_conv_forward_native_prefill(vllm_config):
 
     attn_metadata_dict = {prefix: attn_metadata}
     with set_forward_context(attn_metadata=attn_metadata_dict, vllm_config=vllm_config):
-        # This will call forward_native because device is CPU
         layer.forward_native(hidden_states, output)
 
     assert not torch.allclose(output, torch.zeros_like(output))
@@ -127,6 +131,75 @@ def test_short_conv_forward_native_prefill(vllm_config):
     assert not torch.allclose(conv_state, torch.zeros_like(conv_state))
 
 
-if __name__ == "__main__":
-    # Manually run if needed
-    pass
+def test_short_conv_forward_native_decode(vllm_config):
+    prefix = "test_layer_decode"
+    config = SimpleNamespace(conv_L_cache=4, conv_bias=True)
+    dim = 16
+
+    from vllm.config import set_current_vllm_config
+
+    with set_current_vllm_config(vllm_config):
+        layer = ShortConv(config=config, dim=dim, layer_idx=0, prefix=prefix)
+
+    layer.to("cpu")
+    dispatch_cpu_unquantized_gemm(layer.in_proj, remove_weight=False)
+    dispatch_cpu_unquantized_gemm(layer.out_proj, remove_weight=False)
+
+    # Mock AttentionMetadata for 2 decode requests
+    num_decodes = 2
+    state_indices_tensor_d = torch.tensor([0, 1], dtype=torch.int32)
+
+    attn_metadata = ShortConvAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decodes,
+        num_reqs=num_decodes,
+        query_start_loc_p=None,
+        has_initial_states_p=None,
+        state_indices_tensor_p=torch.empty((0,), dtype=torch.int32),
+        state_indices_tensor_d=state_indices_tensor_d,
+        num_accepted_tokens=None,
+        query_start_loc_d=torch.tensor([0, 1, 2], dtype=torch.int32),
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        num_computed_tokens_p=None,
+        seq_lens=torch.tensor([1, 1]),
+    )
+
+    # Mock KV cache (2 blocks for 2 requests)
+    conv_state = torch.randn((2, config.conv_L_cache - 1, dim))
+    layer.kv_cache = ((conv_state,),)
+
+    hidden_states = torch.randn((num_decodes, dim))
+    output = torch.zeros_like(hidden_states)
+
+    old_conv_state = conv_state.clone()
+
+    attn_metadata_dict = {prefix: attn_metadata}
+    with set_forward_context(attn_metadata=attn_metadata_dict, vllm_config=vllm_config):
+        layer.forward_native(hidden_states, output)
+
+    assert not torch.allclose(output, torch.zeros_like(output))
+    # Check if KV cache was updated
+    assert not torch.allclose(conv_state, old_conv_state)
+
+
+def test_dispatch_cpu_unquantized_gemm_conv_layer():
+    # Create a mock layer with >2D weights (convolution-like)
+    class MockConvLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(16, 1, 4))
+            self.bias = torch.nn.Parameter(torch.randn(16))
+
+    layer = MockConvLayer()
+
+    # This should set layer.cpu_linear to _gemm_not_supported
+    dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+
+    assert hasattr(layer, "cpu_linear")
+
+    with pytest.raises(NotImplementedError, match="GEMM not supported for this layer"):
+        layer.cpu_linear(torch.randn(1, 16), layer.weight, layer.bias)
