@@ -115,7 +115,7 @@ class ShortConv(MambaBase, CustomOp):
             return
 
         # Continuous Batching / Real Forward Pass
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        self_kv_cache = self.kv_cache[0]
         # conv_state shape usually (num_blocks, dim, L_cache - 1)
         conv_state = self_kv_cache[0]
 
